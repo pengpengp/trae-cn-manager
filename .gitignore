@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Database
+*.db
+
+# Keys
+*.key
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evidence
+.sisyphus/
+
+# Logs
+*.log
+
+# Temp test artifacts
+_slider_temp.jpg
+captcha_body.html
+page.html
+*.png
+
+# Test results dirs
+slider_*/**/*.png
+slider_test_results/
+drag_test/
+captcha_samples/
+debug_*.png
