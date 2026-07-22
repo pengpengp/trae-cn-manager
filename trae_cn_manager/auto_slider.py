@@ -17,14 +17,14 @@ import re
 from pathlib import Path
 from typing import Optional, Tuple
 
-import cv2
-import numpy as np
 from playwright.async_api import Page, Frame
 
 logger = logging.getLogger(__name__)
 
-# Try importing captcha-recognizer
+# Try importing captcha-recognizer (heavy: pulls in opencv, numpy, onnxruntime)
 try:
+    import cv2
+    import numpy as np
     from captcha_recognizer.slider import Slider as _Slider
     _MODEL = _Slider()
     _MODEL_AVAILABLE = True
