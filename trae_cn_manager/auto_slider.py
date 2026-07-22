@@ -165,28 +165,44 @@ class AutoSlider:
 
         logger.info(f"Gap detected at {display_offset:.1f}px (confidence={confidence:.3f})")
 
-        # Step 5-6: Drag slider with offset probing
-        # Model is consistently off by ~25px; probe wider range efficiently
-        base_offset = display_offset
-        # Start with model, then jump +25px (calibrated error), then probe around
-        deltas = [0, 25, 10, 15, 20, 30, 5, 35, -5, -10, 8, 18, 22, 28, -3, -8]
-        offsets_unique: list[float] = []
-        seen_offsets: set[int] = set()
-        for d in deltas:
-            o = base_offset + d
-            key = round(o / 5) * 5
-            if o > 0 and key not in seen_offsets:
-                seen_offsets.add(key)
-                offsets_unique.append(o)
+        # Step 5-6: Drag slider with per-image re-detection
+        #
+        # OLD (buggy) strategy: probe 16 fixed deltas [0, 25, 10, 15, ...]
+        # against a SINGLE gap detection. Problem: each failed attempt refreshes
+        # the captcha image, so the gap moves to a completely new position and
+        # all subsequent deltas (computed from the OLD image) are meaningless.
+        #
+        # NEW strategy: after each failed attempt, re-detect the gap on the
+        # fresh image. Try a small ±3px jitter first (sub-pixel precision),
+        # then move on. With the padding bug fixed, the model offset is now
+        # accurate to ~2-3px, so usually 1-2 attempts suffice.
+        max_attempts = 5
+        for attempt_idx in range(max_attempts):
+            if attempt_idx == 0:
+                # First attempt: use original detection
+                try_offset = display_offset
+            else:
+                # Re-detect on refreshed image
+                logger.info("Re-detecting gap on refreshed image...")
+                display_offset, confidence = await self._detect_gap(captcha_frame)
+                if display_offset <= 0:
+                    logger.warning("Re-detection failed, refreshing again...")
+                    await self._click_refresh(captcha_frame)
+                    await page.wait_for_timeout(2000)
+                    continue
+                # Small jitter on retry to handle sub-pixel precision
+                jitter = [0, -3, 3, -2, 2][attempt_idx % 5]
+                try_offset = display_offset + jitter
 
-        for attempt_idx, try_offset in enumerate(offsets_unique):
-            if attempt_idx > 0:
-                logger.info(f"Trying offset {try_offset:.0f}px (attempt {attempt_idx + 1})...")
+            logger.info(
+                "Attempt %d/%d: dragging to %.1fpx (conf=%.3f)",
+                attempt_idx + 1, max_attempts, try_offset, confidence,
+            )
 
             drag_ok = await self._drag_slider(captcha_frame, try_offset)
             if not drag_ok:
                 logger.warning(f"Drag failed at {try_offset:.0f}px")
-                if attempt_idx + 1 < len(offsets_unique):
+                if attempt_idx + 1 < max_attempts:
                     await self._click_refresh(captcha_frame)
                     await page.wait_for_timeout(2000)
                 continue
@@ -198,11 +214,11 @@ class AutoSlider:
                 return True
 
             # Refresh for next attempt
-            if attempt_idx + 1 < len(offsets_unique):
+            if attempt_idx + 1 < max_attempts:
                 await self._click_refresh(captcha_frame)
                 await page.wait_for_timeout(2000)
 
-        logger.warning("Captcha not solved after all offset attempts")
+        logger.warning(f"Captcha not solved after {max_attempts} attempts")
         return False
 
     async def _wait_for_captcha_frame(
@@ -286,21 +302,25 @@ class AutoSlider:
             logger.debug("Model detected no gap (offset=%s, conf=%s)", model_offset, model_conf)
             return (0.0, model_conf)
 
-        # 4. Scale: model space (640x640 letterbox) -> display space
+        # 4. Scale: model returns offset in *original image coordinates* (the
+        #    library's postprocess() already calls scale_boxes() to map the
+        #    640x640 letterbox output back to the source image's native
+        #    resolution). So we only need to scale from natural -> display.
         bg_box = await bg_img_el.bounding_box()
         display_w = bg_box["width"] if bg_box else 340.0
 
-        # Model uses 640x640 with letterbox (pad to maintain aspect ratio)
-        model_scale = min(640.0 / natural_w, 640.0 / natural_h)
-        padded_w = natural_w * model_scale
-        pad_left = (640.0 - padded_w) / 2.0
+        # OLD (buggy) code incorrectly divided by model_scale (640/natural_w),
+        # causing the computed offset to be ~14-16% too small for 552x344
+        # images (e.g. 17px short on a 123px drag — exactly the "差一点距离"
+        # symptom the user reported).
+        display_offset = model_offset * (display_w / natural_w)
 
-        # Remove model padding and scale to natural size
-        offset_natural = (model_offset - pad_left) / model_scale
-
-        # Scale from natural to display
-        display_offset = offset_natural * (display_w / natural_w)
-
+        logger.info(
+            "gap offset: model=%.1fpx (natural coords), display=%.1fpx "
+            "(natural=%dx%d, display_w=%.1f, conf=%.3f)",
+            model_offset, display_offset, natural_w, natural_h,
+            display_w, model_conf,
+        )
         return (display_offset, model_conf)
 
     async def _drag_slider(
