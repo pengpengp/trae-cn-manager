@@ -579,7 +579,7 @@ class ReceiveSmsFreeProvider(SmsProvider):
     * Pure HTML, no JS, real-time message display
     """
 
-    BASE_URL = "https://receivesms-free.com"
+    BASE_URL = "https://www.receivesms-free.com"
     COUNTRY_URL = "/cn/"
 
     @property
@@ -641,10 +641,14 @@ class ReceiveSmsFreeProvider(SmsProvider):
     def get_messages(self, phone: str) -> list[SmsMessage]:
         """Fetch messages for a phone number.
 
-        Page structure (3-line groups):
-            Sender
-            <relative time>
-            Message content (may be multi-line)
+        Page structure:
+            <ul class="sms-list">
+              <li class="sms-item">
+                <div class="sms-top">{sender}{relative_time}</div>
+                <div class="sms-text clamp-2">{content}</div>
+              </li>
+              ...
+            </ul>
         """
         phone_clean = re.sub(r"^00|\+|^86", "", phone.strip())
         if not phone_clean.startswith("86"):
@@ -662,66 +666,37 @@ class ReceiveSmsFreeProvider(SmsProvider):
         soup = BeautifulSoup(resp.text, "lxml")
         messages: list[SmsMessage] = []
 
-        # Each message appears as: sender / time / content.
-        # Parse by scanning text blocks.
-        main = soup.find(class_=lambda c: c and ("content" in c.lower() or "main" in c.lower() or "message" in c.lower()))
-        if not main:
-            main = soup
-
-        text_blocks: list[str] = []
-        for tag in main.find_all(["p", "div", "span", "h1", "h2", "h3", "h4", "li"], recursive=True):
-            t = tag.get_text(strip=True)
-            if not t or len(t) < 2:
+        # Each message is <li class="sms-item"> with .sms-top and .sms-text.
+        for item in soup.select("li.sms-item, .sms-list li"):
+            top_el = item.select_one(".sms-top")
+            text_el = item.select_one(".sms-text")
+            if not top_el or not text_el:
                 continue
-            cls = " ".join(tag.get("class", []))
-            if any(skip in cls.lower() for skip in ["header", "footer", "nav", "menu", "sidebar"]):
-                continue
-            if any(skip in t.lower() for skip in [
-                "faq", "how to use", "cookies", "privacy policy", "terms",
-                "received messages", "available china", "available countries",
-                "how often", "benefits of using", "is receiving sms",
-                "how to receive sms", "in summary", "get your china",
-                "available numbers", "choose another",
-            ]):
-                continue
-            text_blocks.append(t)
-
-        # Parse 3-line groups: sender, timestamp, content.
-        i = 0
-        while i < len(text_blocks) - 2:
-            sender = text_blocks[i]
-            ts = text_blocks[i + 1]
-            content = text_blocks[i + 2]
-
-            # Skip if sender looks like a timestamp/nav.
-            if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}", sender):
-                i += 1
-                continue
-            if sender in ("Active", "Online", "Offline", "China",
-                          "Received Messages", "Available China Numbers"):
-                i += 1
-                continue
-            if "http" in sender or len(sender) > 50:
-                i += 1
+            top_text = top_el.get_text(separator=" ", strip=True)
+            content = text_el.get_text(separator=" ", strip=True)
+            if not content:
                 continue
 
-            # Skip pure navigation text.
-            if sender.lower().startswith(("available", "received", "how")):
-                i += 1
-                continue
+            # sms-top = "{sender}{relative_time}" e.g. "PAYSET 20 minutes ago"
+            # Split on the trailing "N minutes/hours/days ago".
+            sender = top_text
+            timestamp = ""
+            ts_match = re.search(
+                r"(\d+\s*(?:minutes?|hours?|days?|weeks?|months?)\s*ago)$",
+                top_text, re.IGNORECASE,
+            )
+            if ts_match:
+                timestamp = ts_match.group(1).strip()
+                sender = top_text[:ts_match.start()].strip()
 
-            if content and len(content) > 3:
-                otp_match = _OTP_RE.search(content)
-                messages.append(SmsMessage(
-                    sender=sender,
-                    content=content,
-                    timestamp=ts,
-                    is_otp=bool(otp_match),
-                    otp_code=otp_match.group(1) if otp_match else "",
-                ))
-                i += 3
-                continue
-            i += 1
+            otp_match = _OTP_RE.search(content)
+            messages.append(SmsMessage(
+                sender=sender,
+                content=content,
+                timestamp=timestamp,
+                is_otp=bool(otp_match),
+                otp_code=otp_match.group(1) if otp_match else "",
+            ))
 
         logger.info("Found %d messages for %s from receivesms-free.com", len(messages), phone)
         return messages
