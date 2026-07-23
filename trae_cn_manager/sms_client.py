@@ -70,22 +70,44 @@ class SmsProvider(ABC):
         timeout: int = 180,
         poll_interval: int = 10,
     ) -> Optional[str]:
-        """Poll *get_messages* until an OTP code appears.
+        """Poll *get_messages* until a NEW OTP code appears.
 
-        Returns the first 6-digit OTP found, or *None* on timeout.
+        First poll establishes a baseline of existing messages (old messages
+        on public SMS receiving sites). Subsequent polls only look for
+        NEW messages containing a 6-digit OTP code.
+
+        Returns the OTP code, or *None* on timeout.
         """
         deadline = time.time() + timeout
         known: set[str] = set()
+        first_poll = True
+        phone_digits = re.sub(r"\D", "", phone)
+
         while time.time() < deadline:
             msgs = self.get_messages(phone)
-            for m in msgs:
-                if m.is_otp and m.otp_code and m.content not in known:
+
+            if first_poll:
+                for m in msgs:
+                    known.add(m.content)
+                logger.info("Baseline: %d existing messages recorded for %s", len(msgs), phone)
+                first_poll = False
+                time.sleep(poll_interval)
+                continue
+
+            new_msgs = [m for m in msgs if m.content not in known]
+            for m in new_msgs:
+                known.add(m.content)
+                if m.is_otp and m.otp_code:
+                    if m.otp_code in phone_digits:
+                        logger.warning("Skipping OTP %s (matches phone number)", m.otp_code)
+                        continue
                     logger.info("OTP found: %s  (sender=%s)", m.otp_code, m.sender)
                     return m.otp_code
-                known.add(m.content)
+
             remaining = int(deadline - time.time())
-            logger.debug("No OTP yet, sleeping %ds (%ds left)", poll_interval, remaining)
+            logger.debug("No new OTP yet, sleeping %ds (%ds left)", poll_interval, remaining)
             time.sleep(poll_interval)
+
         logger.warning("wait_for_otp timed out after %ds", timeout)
         return None
 
