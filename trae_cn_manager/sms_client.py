@@ -365,7 +365,7 @@ class ReceiveSmsIoProvider(SmsProvider):
         numbers: list[PhoneNumber] = []
 
         # Numbers are listed as <a> tags with href="/temporary-numbers/china/8612345678901/"
-        # Inside a container with country-list or similar
+        # Page is localised: "活跃" (zh) or "active" (en).
         for link in soup.find_all("a", href=re.compile(r"/temporary-numbers/china/\d{10,}/")):
             text = link.get_text(strip=True)
             if not text:
@@ -374,30 +374,24 @@ class ReceiveSmsIoProvider(SmsProvider):
             if not phone_digits or len(phone_digits) < 10:
                 continue
 
-            # Check if the parent block says "Active"
+            # receive-sms.io country page only lists live numbers, so we treat
+            # every listed number as active (no extra status filter needed).
             parent_text = link.parent.get_text() if link.parent else ""
-            is_active = "active" in parent_text.lower()
 
-            # Extract "Added: X ago" from surrounding text
-            added_match = re.search(r"Added:\s*(.+?)(?:<|$)", str(link.parent.parent) if link.parent and link.parent.parent else "")
+            # Extract "已添加: X ago" / "Added: X ago" from surrounding text.
             added_str = ""
-            if added_match:
-                added_str = added_match.group(1).strip()
-            else:
-                page_text = parent_text
-                m = re.search(r"Added:\s*(.+?)(?:\||$)", page_text)
-                if m:
-                    added_str = m.group(1).strip()
+            m = re.search(r"(?:Added|已添加)[:\s]*([^\n|<]+)", parent_text)
+            if m:
+                added_str = m.group(1).strip()
 
-            if is_active:
-                numbers.append(PhoneNumber(
-                    phone=phone_digits,
-                    country="CN",
-                    carrier="",
-                    recent_count=0,
-                    last_active=added_str,
-                    raw_label=text,
-                ))
+            numbers.append(PhoneNumber(
+                phone=phone_digits,
+                country="CN",
+                carrier="",
+                recent_count=0,
+                last_active=added_str,
+                raw_label=text,
+            ))
 
         # Deduplicate
         seen: set[str] = set()
@@ -574,6 +568,166 @@ class QuackrProvider(SmsProvider):
 
 
 # ---------------------------------------------------------------------------
+# ReceiveSmsFreeProvider  (36+ +86 numbers, normal phone segments)
+# ---------------------------------------------------------------------------
+
+class ReceiveSmsFreeProvider(SmsProvider):
+    """Scrapes receivesms-free.com for +86 numbers and messages.
+
+    * 36+ active Chinese numbers, normal segments (13x/15x/17x/18x)
+    * Carrier info included (China Telecom/Mobile/Unicom)
+    * Pure HTML, no JS, real-time message display
+    """
+
+    BASE_URL = "https://receivesms-free.com"
+    COUNTRY_URL = "/cn/"
+
+    @property
+    def name(self) -> str:
+        return "receivesms-free"
+
+    def get_available_numbers(self) -> list[PhoneNumber]:
+        url = f"{self.BASE_URL}{self.COUNTRY_URL}"
+        logger.info("Fetching numbers from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("receivesms-free.com fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        numbers: list[PhoneNumber] = []
+
+        # Links look like: <a href="/cn/8617942231299/">+86 179 4223 1299 China Unicom</a>
+        for link in soup.find_all("a", href=re.compile(r"/cn/\d{10,}/?")):
+            text = link.get_text(separator=" ", strip=True)
+            if not text:
+                continue
+            # Extract phone digits from href (more reliable than text).
+            href = link.get("href", "")
+            phone_digits = re.sub(r"\D", "", href.replace("/cn/", ""))
+            if len(phone_digits) < 10:
+                continue
+
+            # Carrier from link text (e.g. "China Unicom", "China Mobile", "China Telecom").
+            carrier = ""
+            for abbr, full in [("CT", "China Telecom"), ("CM", "China Mobile"), ("CU", "China Unicom")]:
+                if full.lower() in text.lower():
+                    carrier = abbr
+                    break
+
+            numbers.append(PhoneNumber(
+                phone=phone_digits,
+                country="CN",
+                carrier=carrier,
+                recent_count=0,
+                last_active="",
+                raw_label=text[:100],
+            ))
+
+        # Deduplicate
+        seen: set[str] = set()
+        unique: list[PhoneNumber] = []
+        for n in numbers:
+            if n.phone not in seen:
+                seen.add(n.phone)
+                unique.append(n)
+
+        logger.info("Found %d +86 numbers from receivesms-free.com", len(unique))
+        return unique
+
+    def get_messages(self, phone: str) -> list[SmsMessage]:
+        """Fetch messages for a phone number.
+
+        Page structure (3-line groups):
+            Sender
+            <relative time>
+            Message content (may be multi-line)
+        """
+        phone_clean = re.sub(r"^00|\+|^86", "", phone.strip())
+        if not phone_clean.startswith("86"):
+            phone_clean = "86" + phone_clean
+        url = f"{self.BASE_URL}/cn/{phone_clean}/"
+        logger.info("Fetching messages from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("receivesms-free.com fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        messages: list[SmsMessage] = []
+
+        # Each message appears as: sender / time / content.
+        # Parse by scanning text blocks.
+        main = soup.find(class_=lambda c: c and ("content" in c.lower() or "main" in c.lower() or "message" in c.lower()))
+        if not main:
+            main = soup
+
+        text_blocks: list[str] = []
+        for tag in main.find_all(["p", "div", "span", "h1", "h2", "h3", "h4", "li"], recursive=True):
+            t = tag.get_text(strip=True)
+            if not t or len(t) < 2:
+                continue
+            cls = " ".join(tag.get("class", []))
+            if any(skip in cls.lower() for skip in ["header", "footer", "nav", "menu", "sidebar"]):
+                continue
+            if any(skip in t.lower() for skip in [
+                "faq", "how to use", "cookies", "privacy policy", "terms",
+                "received messages", "available china", "available countries",
+                "how often", "benefits of using", "is receiving sms",
+                "how to receive sms", "in summary", "get your china",
+                "available numbers", "choose another",
+            ]):
+                continue
+            text_blocks.append(t)
+
+        # Parse 3-line groups: sender, timestamp, content.
+        i = 0
+        while i < len(text_blocks) - 2:
+            sender = text_blocks[i]
+            ts = text_blocks[i + 1]
+            content = text_blocks[i + 2]
+
+            # Skip if sender looks like a timestamp/nav.
+            if re.match(r"^\d{1,2}/\d{1,2}/\d{2,4}", sender):
+                i += 1
+                continue
+            if sender in ("Active", "Online", "Offline", "China",
+                          "Received Messages", "Available China Numbers"):
+                i += 1
+                continue
+            if "http" in sender or len(sender) > 50:
+                i += 1
+                continue
+
+            # Skip pure navigation text.
+            if sender.lower().startswith(("available", "received", "how")):
+                i += 1
+                continue
+
+            if content and len(content) > 3:
+                otp_match = _OTP_RE.search(content)
+                messages.append(SmsMessage(
+                    sender=sender,
+                    content=content,
+                    timestamp=ts,
+                    is_otp=bool(otp_match),
+                    otp_code=otp_match.group(1) if otp_match else "",
+                ))
+                i += 3
+                continue
+            i += 1
+
+        logger.info("Found %d messages for %s from receivesms-free.com", len(messages), phone)
+        return messages
+
+
+# ---------------------------------------------------------------------------
 # SuperCloudSMSProvider  (fallback)
 # ---------------------------------------------------------------------------
 
@@ -655,15 +809,21 @@ class SuperCloudSMSProvider(SmsProvider):
 def create_sms_client() -> SmsProvider:
     """Create the best available SMS provider.
 
-    Tries providers in order of reliability/number count:
-      1. TextVerificationProvider  (44 numbers, most reliable)
-      2. ReceiveSmsIoProvider      (9+ active numbers, good freshness)
-      3. QuackrProvider            (large source, but China often empty)
-      4. SuperCloudSMSProvider     (fewer numbers, least reliable)
+    Tries providers in order of likelihood to bypass Trae's number blocking:
+      1. ReceiveSmsFreeProvider   (36+ numbers, normal segments 13x/15x/17x/18x)
+      2. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
+      3. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
+      4. QuackrProvider            (large source, but China often empty)
+      5. SuperCloudSMSProvider     (fewer numbers, least reliable)
+
+    Note: Text-verification.net's IoT segments (196/197/181) are blocked by
+    Trae. Normal segments (13x/15x/17x/18x) from receivesms-free.com and
+    receive-sms.io have a much better chance of receiving Trae OTPs.
     """
     providers: list[tuple[str, SmsProvider]] = [
-        ("TextVerificationProvider", TextVerificationProvider()),
+        ("ReceiveSmsFreeProvider", ReceiveSmsFreeProvider()),
         ("ReceiveSmsIoProvider", ReceiveSmsIoProvider()),
+        ("TextVerificationProvider", TextVerificationProvider()),
         ("QuackrProvider", QuackrProvider()),
         ("SuperCloudSMSProvider", SuperCloudSMSProvider()),
     ]
