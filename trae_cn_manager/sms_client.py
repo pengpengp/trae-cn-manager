@@ -1053,14 +1053,18 @@ class GoinSmsProvider(SmsProvider):
     def get_messages(self, phone: str) -> list[SmsMessage]:
         """Fetch SMS messages for a given phone number from goinsms.xyz.
 
-        Page structure is a simple table:
-            <table>
-              <tr>
-                <td>{sender}</td>
-                <td>{content}</td>
-                <td>{timestamp}</td>
-              </tr>
-            </table>
+        Page structure is div-based (NOT a <table>):
+            <div class="rowbox pcbox">  <!-- header -->
+                <div class="col-md-3">From</div>
+                <div class="col-md-6">Messages</div>
+                <div class="col-md-3">Time</div>
+            </div>
+            <div class="rowbox message_details">
+                <div class="col-md-3 sender">{sender}</div>
+                <div class="col-md-6 msg">{content}</div>
+                <div class="col-md-3 time">{timestamp}</div>
+            </div>
+            ...
         """
         # goinsms.xyz uses local 11-digit phone (without 86 prefix) in URL
         phone_local = re.sub(r"^00|\+|^86", "", phone.strip())
@@ -1072,70 +1076,97 @@ class GoinSmsProvider(SmsProvider):
 
         url = f"{self.BASE_URL}/sms.php?p={phone_local}"
         logger.info("Fetching messages from %s", url)
-        try:
-            with _build_client() as client:
-                resp = client.get(url, timeout=30)
-                resp.raise_for_status()
-        except Exception as exc:
-            logger.warning("goinsms.xyz fetch failed: %s", exc)
+
+        # Retry logic — goinsms.xyz is behind Cloudflare and sometimes
+        # drops the connection mid-flight (WinError 10054).
+        last_exc: Exception | None = None
+        html = ""
+        for attempt in range(3):
+            try:
+                with _build_client() as client:
+                    resp = client.get(url, timeout=30)
+                    resp.raise_for_status()
+                    html = resp.text
+                    break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("goinsms.xyz fetch attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(2)  # backoff before retry
+        else:
+            logger.error("goinsms.xyz fetch failed after 3 retries: %s", last_exc)
             return []
 
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = BeautifulSoup(html, "lxml")
         messages: list[SmsMessage] = []
 
-        # Find the message table — goinsms.xyz renders From | Messages | Time
-        # in a simple 3-column table. Locate the first table with rows.
-        msg_table = None
-        for table in soup.find_all("table"):
-            rows = table.find_all("tr")
-            if len(rows) >= 2:
-                # Check header row
-                header_cells = rows[0].find_all(["th", "td"])
-                header_text = " ".join(c.get_text(strip=True).lower() for c in header_cells)
-                if "from" in header_text and ("message" in header_text or "time" in header_text):
-                    msg_table = table
-                    break
+        # Primary parser: div.rowbox.message_details
+        # Each row contains div.sender, div.msg, div.time
+        for row in soup.select("div.rowbox.message_details"):
+            sender_el = row.select_one("div.sender, .col-md-3.sender")
+            msg_el = row.select_one("div.msg, .col-md-6.msg")
+            time_el = row.select_one("div.time, .col-md-3.time")
 
-        # If no proper table found, fall back to first table with rows
-        if msg_table is None:
-            for table in soup.find_all("table"):
-                if len(table.find_all("tr")) >= 2:
-                    msg_table = table
-                    break
+            sender = sender_el.get_text(strip=True) if sender_el else ""
+            content = msg_el.get_text(separator=" ", strip=True) if msg_el else ""
+            timestamp = time_el.get_text(strip=True) if time_el else ""
 
-        if msg_table is not None:
-            rows = msg_table.find_all("tr")
-            for row in rows[1:]:  # skip header
-                cells = row.find_all("td")
-                if len(cells) < 3:
-                    continue
-                sender = cells[0].get_text(strip=True)
-                content = cells[1].get_text(strip=True)
-                timestamp = cells[2].get_text(strip=True)
+            if not content:
+                continue
+            otp_match = _OTP_RE.search(content)
+            messages.append(SmsMessage(
+                sender=sender,
+                content=content,
+                timestamp=timestamp,
+                is_otp=bool(otp_match),
+                otp_code=otp_match.group(1) if otp_match else "",
+            ))
 
-                if not content:
-                    continue
-                otp_match = _OTP_RE.search(content)
-                messages.append(SmsMessage(
-                    sender=sender,
-                    content=content,
-                    timestamp=timestamp,
-                    is_otp=bool(otp_match),
-                    otp_code=otp_match.group(1) if otp_match else "",
-                ))
-
-        # Fallback: parse the page text for "From / Messages / Time" blocks
+        # Fallback 1: try <table> structure (older version of the site)
         if not messages:
-            # The page has 3-column rows rendered as plain text. Try parsing.
+            msg_table = None
+            for table in soup.find_all("table"):
+                rows = table.find_all("tr")
+                if len(rows) >= 2:
+                    header_cells = rows[0].find_all(["th", "td"])
+                    header_text = " ".join(c.get_text(strip=True).lower() for c in header_cells)
+                    if "from" in header_text and ("message" in header_text or "time" in header_text):
+                        msg_table = table
+                        break
+            if msg_table is None:
+                for table in soup.find_all("table"):
+                    if len(table.find_all("tr")) >= 2:
+                        msg_table = table
+                        break
+            if msg_table is not None:
+                rows = msg_table.find_all("tr")
+                for row in rows[1:]:
+                    cells = row.find_all("td")
+                    if len(cells) < 3:
+                        continue
+                    sender = cells[0].get_text(strip=True)
+                    content = cells[1].get_text(strip=True)
+                    timestamp = cells[2].get_text(strip=True)
+                    if not content:
+                        continue
+                    otp_match = _OTP_RE.search(content)
+                    messages.append(SmsMessage(
+                        sender=sender,
+                        content=content,
+                        timestamp=timestamp,
+                        is_otp=bool(otp_match),
+                        otp_code=otp_match.group(1) if otp_match else "",
+                    ))
+
+        # Fallback 2: parse the page text for timestamp-prefixed blocks
+        if not messages:
             all_text = soup.get_text(separator="\n")
             lines = [l.strip() for l in all_text.split("\n") if l.strip()]
-
-            # Look for timestamp patterns like "2026-07-22 23:43:44"
             i = 0
             while i < len(lines) - 2:
                 # Heuristic: if line[i+2] is a timestamp, then line[i] is sender
                 # and line[i+1] is content
-                if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$", lines[i + 2] if i + 2 < len(lines) else ""):
+                if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$",
+                            lines[i + 2] if i + 2 < len(lines) else ""):
                     sender = lines[i]
                     content = lines[i + 1]
                     timestamp = lines[i + 2]
