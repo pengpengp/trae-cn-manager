@@ -778,24 +778,410 @@ class SuperCloudSMSProvider(SmsProvider):
 
 
 # ---------------------------------------------------------------------------
+# Sms24MeProvider  (1,116 +86 numbers, mixed real + IoT segments)
+# ---------------------------------------------------------------------------
+
+class Sms24MeProvider(SmsProvider):
+    """Scrapes sms24.me for +86 numbers and messages.
+
+    * Largest free pool: 1,116 active Chinese numbers across 20 pages
+    * Mix of real segments (13x/15x/17x/18x) and IoT (180/181)
+    * Pure static HTML, no JS, no Cloudflare
+    * Per-number URL: /en/numbers/{phone}, paginated
+    """
+
+    BASE_URL = "https://sms24.me"
+    COUNTRY_URL = "/en/countries/cn"
+
+    @property
+    def name(self) -> str:
+        return "sms24-me"
+
+    def get_available_numbers(self) -> list[PhoneNumber]:
+        """Fetch +86 numbers from the first page of sms24.me/cn.
+
+        Page 1 lists the 15 newest numbers. Pagination available at
+        /en/countries/cn/{N} but for our use case (need a fresh, clean number),
+        the first page is sufficient.
+        """
+        url = f"{self.BASE_URL}{self.COUNTRY_URL}"
+        logger.info("Fetching numbers from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("sms24.me fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        numbers: list[PhoneNumber] = []
+
+        # Number links: <a href="/en/numbers/8613197115843">+8613197115843</a>
+        # Page also shows "X SMS received" near each link.
+        for link in soup.find_all("a", href=re.compile(r"/en/numbers/86\d{9,12}")):
+            href = link.get("href", "")
+            phone_digits = re.sub(r"\D", "", href.replace("/en/numbers/", ""))
+            if not phone_digits or not phone_digits.startswith("86"):
+                continue
+            # Skip extra-short or test numbers (e.g. 8612345678910 is a placeholder)
+            if len(phone_digits) < 11:
+                continue
+
+            # Try to extract "X SMS received" from sibling text
+            parent_text = link.parent.get_text(separator=" ", strip=True) if link.parent else ""
+            sms_count = 0
+            m = re.search(r"(\d+)\s*SMS\s*received", parent_text, re.IGNORECASE)
+            if m:
+                try:
+                    sms_count = int(m.group(1))
+                except ValueError:
+                    pass
+
+            # Carrier not shown on sms24.me listing page
+            carrier = ""
+            # Infer carrier from number prefix (3-digit segment)
+            seg = phone_digits[2:5]  # e.g. "131"
+            if seg.startswith(("133", "153", "180", "181", "189")):
+                carrier = "CT"  # China Telecom
+            elif seg.startswith(("134", "135", "136", "137", "138", "139",
+                                  "150", "151", "152", "157", "158", "159",
+                                  "182", "183", "184", "187", "188")):
+                carrier = "CM"  # China Mobile
+            elif seg.startswith(("130", "131", "132", "155", "156",
+                                  "185", "186", "176")):
+                carrier = "CU"  # China Unicom
+
+            numbers.append(PhoneNumber(
+                phone=phone_digits,
+                country="CN",
+                carrier=carrier,
+                recent_count=sms_count,
+                last_active="",
+                raw_label=link.get_text(strip=True)[:100],
+            ))
+
+        # Deduplicate
+        seen: set[str] = set()
+        unique: list[PhoneNumber] = []
+        for n in numbers:
+            if n.phone not in seen:
+                seen.add(n.phone)
+                unique.append(n)
+
+        logger.info("Found %d +86 numbers from sms24.me (page 1)", len(unique))
+        return unique
+
+    def get_messages(self, phone: str) -> list[SmsMessage]:
+        """Fetch SMS messages for a given phone number from sms24.me.
+
+        Page format (plain-text rendered, but parseable by anchor + sibling):
+            [From: SENDER](link)RELATIVE_TIME
+
+            CONTENT_TEXT
+
+            [From: SENDER2](link)RELATIVE_TIME2
+
+            CONTENT_TEXT2
+
+        We use BeautifulSoup to find "From:" anchors, then walk forward
+        in DOM order to grab the content that follows each anchor.
+        """
+        phone_clean = re.sub(r"^00|\+", "", phone.strip())
+        if not phone_clean.startswith("86"):
+            phone_clean = "86" + phone_clean
+        url = f"{self.BASE_URL}/en/numbers/{phone_clean}"
+        logger.info("Fetching messages from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("sms24.me fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        messages: list[SmsMessage] = []
+
+        # Find all anchors that link to /en/messages/{sender_slug}
+        from_anchors = soup.find_all("a", href=re.compile(r"/en/messages/"))
+
+        for anchor in from_anchors:
+            # Sender text is "[From: SENDER_NAME]" — strip prefix
+            sender_text = anchor.get_text(strip=True)
+            sender = re.sub(r"^\[?From:?\s*", "", sender_text, flags=re.IGNORECASE).rstrip("]").strip()
+
+            # The anchor's parent contains the time text after it
+            parent = anchor.parent
+            if not parent:
+                continue
+            # Time text = the trailing text after the anchor inside the parent
+            # Use .find(string=True, recursive=False) — but simpler: get the
+            # whole parent text minus the anchor text.
+            parent_text = parent.get_text(separator=" ", strip=True)
+            # Strip the sender label, remainder is relative time like "36 minutes ago"
+            time_str = parent_text.replace(sender_text, "", 1).strip()
+
+            # Content = the next sibling block of text (could be a <p> or
+            # plain text node after the parent)
+            content = ""
+            # Walk up to the next text-bearing block
+            current = parent
+            for _ in range(5):
+                nxt = current.find_next_sibling()
+                if nxt is None:
+                    break
+                # Get text content if it's a real block
+                t = nxt.get_text(separator=" ", strip=True) if hasattr(nxt, "get_text") else ""
+                if t:
+                    content = t
+                    break
+                current = nxt
+
+            if not content:
+                # Fallback: look at the parent's next sibling's children
+                nxt = parent.find_next_sibling() if parent else None
+                if nxt:
+                    content = nxt.get_text(separator=" ", strip=True)
+
+            if not content:
+                continue
+
+            otp_match = _OTP_RE.search(content)
+            messages.append(SmsMessage(
+                sender=sender,
+                content=content,
+                timestamp=time_str,
+                is_otp=bool(otp_match),
+                otp_code=otp_match.group(1) if otp_match else "",
+            ))
+
+        # Deduplicate by (sender, content, timestamp)
+        seen_keys: set[tuple[str, str, str]] = set()
+        unique_msgs: list[SmsMessage] = []
+        for m in messages:
+            key = (m.sender, m.content, m.timestamp)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique_msgs.append(m)
+
+        logger.info("Found %d messages for %s from sms24.me", len(unique_msgs), phone)
+        return unique_msgs
+
+
+# ---------------------------------------------------------------------------
+# GoinSmsProvider  (99 +86 numbers, all real segments)
+# ---------------------------------------------------------------------------
+
+class GoinSmsProvider(SmsProvider):
+    """Scrapes goinsms.xyz for +86 numbers and messages.
+
+    * 9 numbers per page × 11 pages = ~99 numbers
+    * All numbers are real segments (135/136/138/152/154/159/182/183/188)
+    * Per-number URL: /sms.php?p={phone_without_86}
+    * Table format: From | Messages | Time
+    """
+
+    BASE_URL = "https://www.goinsms.xyz"
+    COUNTRY_URL = "/cn.php"
+
+    @property
+    def name(self) -> str:
+        return "goinsms"
+
+    def get_available_numbers(self) -> list[PhoneNumber]:
+        url = f"{self.BASE_URL}{self.COUNTRY_URL}"
+        logger.info("Fetching numbers from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("goinsms.xyz fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        numbers: list[PhoneNumber] = []
+
+        # Numbers appear as: +8615012863450 (in plain text, often inside <h3> or <p>)
+        # Find all elements containing "+86" followed by 11 digits
+        for el in soup.find_all(["a", "h3", "p", "span", "div"]):
+            text = el.get_text(strip=True)
+            if not text:
+                continue
+            # Match +86XXXXXXXXXXX (full international format)
+            m = re.search(r"\+?86(1[3-9]\d{9})", text)
+            if not m:
+                continue
+            local_phone = m.group(1)  # 11-digit CN mobile, no 86 prefix
+            phone_full = "86" + local_phone
+
+            # Carrier inference (3-digit segment)
+            seg = local_phone[:3]
+            if seg in ("133", "153", "180", "181", "189", "199"):
+                carrier = "CT"
+            elif seg in ("134", "135", "136", "137", "138", "139",
+                         "150", "151", "152", "157", "158", "159",
+                         "178", "182", "183", "184", "187", "188", "198"):
+                carrier = "CM"
+            elif seg in ("130", "131", "132", "155", "156", "166",
+                         "175", "176", "185", "186"):
+                carrier = "CU"
+            else:
+                carrier = ""
+
+            numbers.append(PhoneNumber(
+                phone=phone_full,
+                country="CN",
+                carrier=carrier,
+                recent_count=0,
+                last_active="",
+                raw_label=text[:100],
+            ))
+
+        # Deduplicate
+        seen: set[str] = set()
+        unique: list[PhoneNumber] = []
+        for n in numbers:
+            if n.phone not in seen:
+                seen.add(n.phone)
+                unique.append(n)
+
+        logger.info("Found %d +86 numbers from goinsms.xyz (page 1)", len(unique))
+        return unique
+
+    def get_messages(self, phone: str) -> list[SmsMessage]:
+        """Fetch SMS messages for a given phone number from goinsms.xyz.
+
+        Page structure is a simple table:
+            <table>
+              <tr>
+                <td>{sender}</td>
+                <td>{content}</td>
+                <td>{timestamp}</td>
+              </tr>
+            </table>
+        """
+        # goinsms.xyz uses local 11-digit phone (without 86 prefix) in URL
+        phone_local = re.sub(r"^00|\+|^86", "", phone.strip())
+        if phone_local.startswith("86"):
+            phone_local = phone_local[2:]
+        if not phone_local.isdigit() or len(phone_local) != 11:
+            logger.warning("Invalid phone format for goinsms.xyz: %s", phone)
+            return []
+
+        url = f"{self.BASE_URL}/sms.php?p={phone_local}"
+        logger.info("Fetching messages from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("goinsms.xyz fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        messages: list[SmsMessage] = []
+
+        # Find the message table — goinsms.xyz renders From | Messages | Time
+        # in a simple 3-column table. Locate the first table with rows.
+        msg_table = None
+        for table in soup.find_all("table"):
+            rows = table.find_all("tr")
+            if len(rows) >= 2:
+                # Check header row
+                header_cells = rows[0].find_all(["th", "td"])
+                header_text = " ".join(c.get_text(strip=True).lower() for c in header_cells)
+                if "from" in header_text and ("message" in header_text or "time" in header_text):
+                    msg_table = table
+                    break
+
+        # If no proper table found, fall back to first table with rows
+        if msg_table is None:
+            for table in soup.find_all("table"):
+                if len(table.find_all("tr")) >= 2:
+                    msg_table = table
+                    break
+
+        if msg_table is not None:
+            rows = msg_table.find_all("tr")
+            for row in rows[1:]:  # skip header
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                sender = cells[0].get_text(strip=True)
+                content = cells[1].get_text(strip=True)
+                timestamp = cells[2].get_text(strip=True)
+
+                if not content:
+                    continue
+                otp_match = _OTP_RE.search(content)
+                messages.append(SmsMessage(
+                    sender=sender,
+                    content=content,
+                    timestamp=timestamp,
+                    is_otp=bool(otp_match),
+                    otp_code=otp_match.group(1) if otp_match else "",
+                ))
+
+        # Fallback: parse the page text for "From / Messages / Time" blocks
+        if not messages:
+            # The page has 3-column rows rendered as plain text. Try parsing.
+            all_text = soup.get_text(separator="\n")
+            lines = [l.strip() for l in all_text.split("\n") if l.strip()]
+
+            # Look for timestamp patterns like "2026-07-22 23:43:44"
+            i = 0
+            while i < len(lines) - 2:
+                # Heuristic: if line[i+2] is a timestamp, then line[i] is sender
+                # and line[i+1] is content
+                if re.match(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}$", lines[i + 2] if i + 2 < len(lines) else ""):
+                    sender = lines[i]
+                    content = lines[i + 1]
+                    timestamp = lines[i + 2]
+                    otp_match = _OTP_RE.search(content)
+                    messages.append(SmsMessage(
+                        sender=sender,
+                        content=content,
+                        timestamp=timestamp,
+                        is_otp=bool(otp_match),
+                        otp_code=otp_match.group(1) if otp_match else "",
+                    ))
+                    i += 3
+                    continue
+                i += 1
+
+        logger.info("Found %d messages for %s from goinsms.xyz", len(messages), phone)
+        return messages
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def create_sms_client() -> SmsProvider:
     """Create the best available SMS provider.
 
-    Tries providers in order of likelihood to bypass Trae's number blocking:
-      1. ReceiveSmsFreeProvider   (36+ numbers, normal segments 13x/15x/17x/18x)
-      2. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
-      3. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
-      4. QuackrProvider            (large source, but China often empty)
-      5. SuperCloudSMSProvider     (fewer numbers, least reliable)
+    Tries providers in order of likelihood to bypass Trae's number blocking.
+    Real-segment providers (13x/15x/17x/18x) come first; IoT-segment
+    providers (196/197/181) come last.
+
+      1. GoinSmsProvider           (~99 numbers, all real segments 13x/15x/17x/18x)
+      2. Sms24MeProvider           (1,116 numbers, mixed real + IoT)
+      3. ReceiveSmsFreeProvider    (36+ numbers, real segments 13x/15x/17x/18x)
+      4. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
+      5. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
+      6. QuackrProvider            (large source, but China often empty)
+      7. SuperCloudSMSProvider     (fewer numbers, least reliable)
 
     Note: Text-verification.net's IoT segments (196/197/181) are blocked by
-    Trae. Normal segments (13x/15x/17x/18x) from receivesms-free.com and
-    receive-sms.io have a much better chance of receiving Trae OTPs.
+    Trae. Normal segments (13x/15x/17x/18x) from goinsms.xyz, sms24.me,
+    receivesms-free.com and receive-sms.io have a much better chance of
+    receiving Trae OTPs.
     """
     providers: list[tuple[str, SmsProvider]] = [
+        ("GoinSmsProvider", GoinSmsProvider()),
+        ("Sms24MeProvider", Sms24MeProvider()),
         ("ReceiveSmsFreeProvider", ReceiveSmsFreeProvider()),
         ("ReceiveSmsIoProvider", ReceiveSmsIoProvider()),
         ("TextVerificationProvider", TextVerificationProvider()),
