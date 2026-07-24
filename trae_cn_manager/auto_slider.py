@@ -137,7 +137,29 @@ class AutoSlider:
         await send_el.click()
         logger.info("Send code clicked, waiting for captcha...")
 
-        # Step 3: Wait for captcha iframe
+        # Step 3+: Wait for captcha then solve
+        return await self.solve_existing(page, max_wait_captcha)
+
+    async def solve_existing(
+        self,
+        page: Page,
+        max_wait_captcha: int = 30,
+    ) -> bool:
+        """Solve an already-triggered captcha (assume phone filled + send clicked).
+
+        Use this when the caller has already filled the phone number and clicked
+        the send-code button — i.e. the captcha iframe is already loading or
+        visible. Calling ``solve()`` again would re-fill the phone input, which
+        fails with "subtree intercepts pointer events" once the captcha overlay
+        is shown.
+        """
+        self._page = page
+
+        if not _MODEL_AVAILABLE:
+            logger.error("captcha-recognizer not installed. Run: pip install captcha-recognizer")
+            return False
+
+        # Wait for captcha iframe to appear
         captcha_frame = await self._wait_for_captcha_frame(page, max_wait_captcha)
         if not captcha_frame:
             logger.error("Captcha iframe did not appear")

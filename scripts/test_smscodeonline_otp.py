@@ -284,8 +284,11 @@ async def try_one_phone(phone: str, headed: bool) -> dict:
                     await page.wait_for_timeout(1000)
 
                 if captcha_frame:
-                    log.info("Captcha detected, solving...")
-                    captcha_solved = await solver.solve(page, clean_phone)
+                    log.info("Captcha detected, solving with solve_existing()...")
+                    # Use solve_existing() — phone is already filled + send_code already clicked.
+                    # Calling solve() would re-fill the phone input, which fails with
+                    # "subtree intercepts pointer events" once the captcha overlay is shown.
+                    captcha_solved = await solver.solve_existing(page)
                     log.info("Captcha solved: %s", captcha_solved)
                 else:
                     log.info("No captcha iframe detected, send_code may have succeeded directly")
