@@ -1410,6 +1410,224 @@ class GoinSmsProvider(SmsProvider):
 
 
 # ---------------------------------------------------------------------------
+# FreeOtpReceiveProvider  (43 numbers, minute-level active, TikTok OTP confirmed)
+# ---------------------------------------------------------------------------
+
+class FreeOtpReceiveProvider(SmsProvider):
+    """Scrapes free-otp-receive.com for +86 numbers and messages.
+
+    * 43 active Chinese numbers (verified 2026-07-24)
+    * All real mobile segments (130/131/132/133/135/136/138/152/153/155/156/159/176/178/181/185/186/188/198/199)
+    * Minute-level message activity (1-8 min ago on all active numbers)
+    * Confirmed receiving ByteDance series SMS (TikTok OTP verified on cn-3)
+    * URL pattern: /en/number/cn-{N}/ where N is a sequential ID (1-43)
+    * Page structure (Next.js + Tailwind CSS):
+        Number list (/en/country/cn/):
+          <a href="/en/number/cn-3/">+86 159 9474 5247</a>
+          <a>Active</a> or <a>Offline</a>
+          <a>Last msg: 1m ago</a>
+        Message page (/en/number/cn-3/):
+          <div class="px-4 sm:px-6 py-4 hover:bg-gray-50 ...">
+            <div class="flex items-start gap-3">
+              <div class="w-9 h-9 ... bg-emerald-500">Wi</div>
+              <div class="flex-1 min-w-0">
+                <div class="flex items-center justify-between gap-2 mb-1">
+                  <span class="text-sm font-semibold ...">Wise</span>
+                  <span class="text-xs ...">1 min ago</span>
+                </div>
+                <p class="text-sm ...">Your Wise verification code is 1621.</p>
+              </div>
+            </div>
+          </div>
+    """
+
+    BASE_URL = "https://free-otp-receive.com"
+    COUNTRY_URL = "/en/country/cn/"
+
+    # Internal cache: phone_digits -> cn-N page ID
+    _id_cache: Dict[str, str] = {}
+
+    @property
+    def name(self) -> str:
+        return "free-otp-receive"
+
+    def get_available_numbers(self) -> list[PhoneNumber]:
+        """Fetch +86 numbers from free-otp-receive.com/en/country/cn/.
+
+        Returns only Active numbers (Offline ones are skipped).
+        Also populates _id_cache for later use by get_messages().
+        """
+        url = f"{self.BASE_URL}{self.COUNTRY_URL}"
+        logger.info("Fetching numbers from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("free-otp-receive.com fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        numbers: list[PhoneNumber] = []
+
+        # Number links: <a href="/en/number/cn-{N}/">+86 XXX XXXX XXXX</a>
+        for link in soup.find_all("a", href=re.compile(r"/en/number/cn-\d+")):
+            href = link.get("href", "")
+            m = re.search(r"/en/number/cn-(\d+)", href)
+            if not m:
+                continue
+            page_id = m.group(1)
+
+            # Link text is "+86 159 9474 5247"
+            text = link.get_text(separator=" ", strip=True)
+            phone_m = re.search(r"\+?86?\s*(\d{3})\s*(\d{4})\s*(\d{4})", text)
+            if not phone_m:
+                continue
+            phone_digits = "86" + "".join(phone_m.groups())
+
+            # Determine Active/Offline by looking at sibling links
+            parent = link.find_parent()
+            if parent is None:
+                continue
+            parent_text = parent.get_text(separator=" ", strip=True)
+            if "Offline" in parent_text:
+                continue  # skip offline numbers
+
+            # Last msg time (best-effort)
+            last_active = ""
+            time_m = re.search(r"Last msg:\s*([^)]+?)(?:\]|$)", parent_text)
+            if time_m:
+                last_active = time_m.group(1).strip()
+
+            # Carrier inference from 3-digit segment
+            seg = phone_digits[2:5]
+            if seg.startswith(("133", "153", "173", "177", "180", "181", "189", "199")):
+                carrier = "CT"
+            elif seg.startswith(("134", "135", "136", "137", "138", "139",
+                                 "150", "151", "152", "157", "158", "159",
+                                 "178", "182", "183", "184", "187", "188", "198")):
+                carrier = "CM"
+            elif seg.startswith(("130", "131", "132", "155", "156",
+                                 "166", "175", "176", "185", "186")):
+                carrier = "CU"
+            else:
+                carrier = ""
+
+            # Cache phone -> page_id mapping
+            self._id_cache[phone_digits] = page_id
+
+            numbers.append(PhoneNumber(
+                phone=phone_digits,
+                country="CN",
+                carrier=carrier,
+                recent_count=0,
+                last_active=last_active,
+                raw_label=f"cn-{page_id}",
+            ))
+
+        # Deduplicate (list page may have duplicate links)
+        seen: set[str] = set()
+        unique: list[PhoneNumber] = []
+        for n in numbers:
+            if n.phone not in seen:
+                seen.add(n.phone)
+                unique.append(n)
+
+        logger.info("Found %d active +86 numbers from free-otp-receive.com", len(unique))
+        return unique
+
+    def _resolve_page_id(self, phone: str) -> Optional[str]:
+        """Resolve a phone number to its cn-N page ID, fetching list if needed."""
+        phone_clean = re.sub(r"^00|\+", "", phone.strip())
+        if not phone_clean.startswith("86"):
+            phone_clean = "86" + phone_clean
+        # Strip non-digits
+        phone_clean = re.sub(r"\D", "", phone_clean)
+
+        if phone_clean in self._id_cache:
+            return self._id_cache[phone_clean]
+
+        # Re-fetch the list to populate cache
+        self.get_available_numbers()
+        return self._id_cache.get(phone_clean)
+
+    def get_messages(self, phone: str) -> list[SmsMessage]:
+        """Fetch SMS messages for a given phone number from free-otp-receive.com.
+
+        Uses the cn-N page ID (resolved via _id_cache or list re-fetch).
+        Parses Tailwind-CSS message blocks.
+        """
+        page_id = self._resolve_page_id(phone)
+        if not page_id:
+            logger.warning("Could not resolve cn-N page ID for phone %s", phone)
+            return []
+
+        url = f"{self.BASE_URL}/en/number/cn-{page_id}/"
+        logger.info("Fetching messages from %s", url)
+
+        last_exc: Exception | None = None
+        html = ""
+        for attempt in range(3):
+            try:
+                with _build_client() as client:
+                    resp = client.get(url, timeout=30)
+                    resp.raise_for_status()
+                    html = resp.text
+                    break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("free-otp-receive.com fetch attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(2)
+        else:
+            logger.error("free-otp-receive.com fetch failed after 3 retries: %s", last_exc)
+            return []
+
+        # Parse messages using regex on the Tailwind structure:
+        #   <span class="text-sm font-semibold...">SENDER</span>
+        #   <span class="text-xs...">TIME ago</span>
+        #   </div>
+        #   <p class="text-sm...">CONTENT</p>
+        messages: list[SmsMessage] = []
+        # This regex captures (sender, timestamp, content) tuples
+        msg_re = re.compile(
+            r'<span class="text-sm font-semibold[^"]*">([^<]+)</span>\s*'
+            r'<span class="text-xs[^"]*">([^<]*\bago\b[^<]*)</span>\s*'
+            r'</div>\s*'
+            r'<p class="text-sm[^"]*">(.*?)</p>',
+            re.DOTALL,
+        )
+        for m in msg_re.finditer(html):
+            sender = m.group(1).strip()
+            timestamp = m.group(2).strip()
+            content_html = m.group(3)
+            # Strip HTML tags from content
+            content = re.sub(r"<[^>]+>", "", content_html)
+            content = (content.replace("&#x27;", "'").replace("&amp;", "&")
+                       .replace("&lt;", "<").replace("&gt;", ">")
+                       .replace("&quot;", '"'))
+            content = re.sub(r"\s+", " ", content).strip()
+            if not content:
+                continue
+            otp_match = _OTP_RE.search(content)
+            # Also try 4-digit OTP (some services use 4-digit)
+            if not otp_match:
+                otp4 = re.search(r"\b(\d{4})\b", content)
+                if otp4 and ("code" in content.lower() or "验证" in content):
+                    otp_match = otp4
+            messages.append(SmsMessage(
+                sender=sender,
+                content=content,
+                timestamp=timestamp,
+                is_otp=bool(otp_match),
+                otp_code=otp_match.group(1) if otp_match else "",
+            ))
+
+        logger.info("Found %d messages for %s (cn-%s) from free-otp-receive.com",
+                    len(messages), phone, page_id)
+        return messages
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1420,21 +1638,23 @@ def create_sms_client() -> SmsProvider:
     Real-segment providers (13x/15x/17x/18x) come first; IoT-segment
     providers (196/197/181) come last.
 
-      1. SmsCodeOnlineProvider     (7,854 numbers, largest CN pool; TikTok OTP visible)
-      2. GoinSmsProvider           (~99 numbers, all real segments 13x/15x/17x/18x)
-      3. Sms24MeProvider           (1,116 numbers, mixed real + IoT)
-      4. ReceiveSmsFreeProvider    (36+ numbers, real segments 13x/15x/17x/18x)
-      5. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
-      6. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
-      7. QuackrProvider            (large source, but China often empty)
-      8. SuperCloudSMSProvider     (fewer numbers, least reliable)
+      1. FreeOtpReceiveProvider    (43 numbers, MINUTE-LEVEL ACTIVE, TikTok OTP confirmed)
+      2. SmsCodeOnlineProvider     (7,854 numbers, largest pool but STALE since ~2026-04)
+      3. GoinSmsProvider           (~99 numbers, all real segments 13x/15x/17x/18x)
+      4. Sms24MeProvider           (1,116 numbers, mixed real + IoT, active)
+      5. ReceiveSmsFreeProvider    (36+ numbers, real segments 13x/15x/17x/18x)
+      6. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
+      7. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
+      8. QuackrProvider            (large source, but China often empty)
+      9. SuperCloudSMSProvider     (fewer numbers, least reliable)
 
     Note: Text-verification.net's IoT segments (196/197/181) are blocked by
-    Trae. Normal segments (13x/15x/17x/18x) from smscodeonline.com, goinsms.xyz,
-    sms24.me, receivesms-free.com and receive-sms.io have a much better chance
-    of receiving Trae OTPs.
+    Trae. Normal segments (13x/15x/17x/18x) from free-otp-receive.com,
+    goinsms.xyz, sms24.me, receivesms-free.com and receive-sms.io have a
+    much better chance of receiving Trae OTPs.
     """
     providers: list[tuple[str, SmsProvider]] = [
+        ("FreeOtpReceiveProvider", FreeOtpReceiveProvider()),
         ("SmsCodeOnlineProvider", SmsCodeOnlineProvider()),
         ("GoinSmsProvider", GoinSmsProvider()),
         ("Sms24MeProvider", Sms24MeProvider()),
