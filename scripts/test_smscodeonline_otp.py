@@ -229,8 +229,9 @@ async def try_one_phone(phone: str, headed: bool) -> dict:
 
         try:
             log.info("Opening trae.cn/login...")
-            await page.goto("https://www.trae.cn/login", wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(2000)
+            # networkidle often times out on trae.cn (long-polling); use domcontentloaded + sleep
+            await page.goto("https://www.trae.cn/login", wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)  # let JS render the login form
 
             # Fill phone (strip +86, take last 11 digits)
             phone_input = await page.query_selector("input.mobile-phone")
