@@ -970,6 +970,229 @@ class Sms24MeProvider(SmsProvider):
 
 
 # ---------------------------------------------------------------------------
+# SmsCodeOnlineProvider  (7854 +86 numbers, the largest free CN pool)
+# ---------------------------------------------------------------------------
+
+class SmsCodeOnlineProvider(SmsProvider):
+    """Scrapes smscodeonline.com for +86 numbers and messages.
+
+    * Largest free pool: 7,854 active Chinese numbers (verified 2026-07-24)
+    * Mix of mobile segments (13x/15x/17x/18x) and some fixed-line virtual
+    * Per-number URL: /virtual-phone/p-{phone_with_86}
+    * Confirmed visible ByteDance series SMS (飞书会议) on platform
+    * Page structure (per-number message page):
+        <div class="card m-2 text-center">
+            <div class="card-header">
+                <span class="mt-0"> Sender: <a href="sender/{name}">{name}</a></span>
+            </div>
+            <div class="card-body">
+                {content with OTP}
+                <footer class="blockquote-footer float-right">{time_ago}</footer>
+            </div>
+        </div>
+    """
+
+    BASE_URL = "https://smscodeonline.com"
+    COUNTRY_URL = "/virtual-phone/cn"
+
+    @property
+    def name(self) -> str:
+        return "smscodeonline"
+
+    def get_available_numbers(self) -> list[PhoneNumber]:
+        """Fetch +86 numbers from smscodeonline.com/virtual-phone/cn.
+
+        Page 1 lists the newest ~10 numbers. The full pool is 7,854 numbers
+        across 393 pages; for registration we only need a fresh clean one.
+        """
+        url = f"{self.BASE_URL}{self.COUNTRY_URL}"
+        logger.info("Fetching numbers from %s", url)
+        try:
+            with _build_client() as client:
+                resp = client.get(url, timeout=30)
+                resp.raise_for_status()
+        except Exception as exc:
+            logger.warning("smscodeonline.com fetch failed: %s", exc)
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        numbers: list[PhoneNumber] = []
+
+        # Number links: <a href=" /virtual-phone/p-86xxxxxxxxxxx ">
+        for link in soup.find_all("a", href=re.compile(r"p-86\d{11}")):
+            href = link.get("href", "")
+            m = re.search(r"p-(86\d{11})", href)
+            if not m:
+                continue
+            phone_digits = m.group(1)
+
+            # Link text is typically "+86 151 7127 9991" or similar
+            text = link.get_text(separator=" ", strip=True)
+
+            # Carrier inference from 3-digit segment (digits 3-5 of full phone)
+            seg = phone_digits[2:5]
+            if seg.startswith(("133", "153", "173", "177", "180", "181", "189", "199")):
+                carrier = "CT"
+            elif seg.startswith(("134", "135", "136", "137", "138", "139",
+                                 "150", "151", "152", "157", "158", "159",
+                                 "178", "182", "183", "184", "187", "188", "198")):
+                carrier = "CM"
+            elif seg.startswith(("130", "131", "132", "155", "156",
+                                 "166", "175", "176", "185", "186")):
+                carrier = "CU"
+            else:
+                carrier = ""  # may be fixed-line or IoT virtual
+
+            numbers.append(PhoneNumber(
+                phone=phone_digits,
+                country="CN",
+                carrier=carrier,
+                recent_count=0,
+                last_active="",
+                raw_label=text[:100],
+            ))
+
+        # Deduplicate
+        seen: set[str] = set()
+        unique: list[PhoneNumber] = []
+        for n in numbers:
+            if n.phone not in seen:
+                seen.add(n.phone)
+                unique.append(n)
+
+        logger.info("Found %d +86 numbers from smscodeonline.com (page 1)", len(unique))
+        return unique
+
+    def get_messages(self, phone: str) -> list[SmsMessage]:
+        """Fetch SMS messages for a given phone number from smscodeonline.com.
+
+        Page structure:
+            <div class="card m-2 text-center">
+                <div class="card-header">
+                    <span class="mt-0"> Sender: <a href="sender/{name}">{name}</a></span>
+                </div>
+                <div class="card-body">
+                    {content with OTP}
+                    <footer class="blockquote-footer float-right">{time_ago}</footer>
+                </div>
+            </div>
+        """
+        phone_clean = re.sub(r"^00|\+", "", phone.strip())
+        if not phone_clean.startswith("86"):
+            phone_clean = "86" + phone_clean
+        # Ensure 13 digits (86 + 11)
+        if len(phone_clean) != 13:
+            logger.warning("Invalid phone format for smscodeonline.com: %s", phone)
+            return []
+
+        url = f"{self.BASE_URL}/virtual-phone/p-{phone_clean}"
+        logger.info("Fetching messages from %s", url)
+
+        # Retry logic — site can be flaky
+        last_exc: Exception | None = None
+        html = ""
+        for attempt in range(3):
+            try:
+                with _build_client() as client:
+                    resp = client.get(url, timeout=30)
+                    resp.raise_for_status()
+                    html = resp.text
+                    break
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("smscodeonline.com fetch attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(2)
+        else:
+            logger.error("smscodeonline.com fetch failed after 3 retries: %s", last_exc)
+            return []
+
+        soup = BeautifulSoup(html, "lxml")
+        messages: list[SmsMessage] = []
+
+        # Primary parser: div.card with .card-header > a (sender) and .card-body (content)
+        for card in soup.select("div.card"):
+            header_link = card.select_one(".card-header a")
+            body_el = card.select_one(".card-body")
+            if not header_link or not body_el:
+                continue
+
+            sender = header_link.get_text(strip=True)
+
+            # Extract content: text of card-body, excluding the footer/clear divs
+            # Remove footer and .clear from a copy
+            body_copy = body_el.__copy__() if hasattr(body_el, "__copy__") else None
+            for sel_to_remove in [".blockquote-footer", ".clear", "footer"]:
+                for el in body_el.select(sel_to_remove):
+                    el.extract()
+            content = body_el.get_text(separator=" ", strip=True)
+            # Re-decode the body (since we mutated it above; if extraction failed, fallback)
+            if not content and body_copy is not None:
+                content = body_copy.get_text(separator=" ", strip=True)
+
+            # Time
+            time_el = card.select_one(".blockquote-footer, footer, .card-body footer")
+            timestamp = time_el.get_text(strip=True) if time_el else ""
+
+            if not content:
+                continue
+            otp_match = _OTP_RE.search(content)
+            messages.append(SmsMessage(
+                sender=sender,
+                content=content,
+                timestamp=timestamp,
+                is_otp=bool(otp_match),
+                otp_code=otp_match.group(1) if otp_match else "",
+            ))
+
+        # Fallback: scan generic list items
+        if not messages:
+            for sel in [".message-item", ".sms-item", ".msg-item", ".list-item",
+                       "[class*='message']", "[class*='sms']", "[class*='msg']"]:
+                for msg_div in soup.select(sel):
+                    sender_el = msg_div.select_one(".sender, .from, .source, [class*='sender']")
+                    content_el = msg_div.select_one(".content, .text, .body, .msg, [class*='content']")
+                    time_el = msg_div.select_one(".time, .date, .timestamp, [class*='time']")
+                    sender = sender_el.get_text(strip=True) if sender_el else ""
+                    content = content_el.get_text(separator=" ", strip=True) if content_el else ""
+                    timestamp = time_el.get_text(strip=True) if time_el else ""
+                    if not content:
+                        continue
+                    otp_match = _OTP_RE.search(content)
+                    messages.append(SmsMessage(
+                        sender=sender,
+                        content=content,
+                        timestamp=timestamp,
+                        is_otp=bool(otp_match),
+                        otp_code=otp_match.group(1) if otp_match else "",
+                    ))
+                if messages:
+                    break
+
+        # Fallback: scan table rows
+        if not messages:
+            for row in soup.find_all("tr"):
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                sender = cells[0].get_text(strip=True)
+                content = cells[1].get_text(strip=True)
+                timestamp = cells[2].get_text(strip=True)
+                if not content:
+                    continue
+                otp_match = _OTP_RE.search(content)
+                messages.append(SmsMessage(
+                    sender=sender,
+                    content=content,
+                    timestamp=timestamp,
+                    is_otp=bool(otp_match),
+                    otp_code=otp_match.group(1) if otp_match else "",
+                ))
+
+        logger.info("Found %d messages for %s from smscodeonline.com", len(messages), phone)
+        return messages
+
+
+# ---------------------------------------------------------------------------
 # GoinSmsProvider  (99 +86 numbers, all real segments)
 # ---------------------------------------------------------------------------
 
@@ -1197,20 +1420,22 @@ def create_sms_client() -> SmsProvider:
     Real-segment providers (13x/15x/17x/18x) come first; IoT-segment
     providers (196/197/181) come last.
 
-      1. GoinSmsProvider           (~99 numbers, all real segments 13x/15x/17x/18x)
-      2. Sms24MeProvider           (1,116 numbers, mixed real + IoT)
-      3. ReceiveSmsFreeProvider    (36+ numbers, real segments 13x/15x/17x/18x)
-      4. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
-      5. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
-      6. QuackrProvider            (large source, but China often empty)
-      7. SuperCloudSMSProvider     (fewer numbers, least reliable)
+      1. SmsCodeOnlineProvider     (7,854 numbers, largest CN pool; TikTok OTP visible)
+      2. GoinSmsProvider           (~99 numbers, all real segments 13x/15x/17x/18x)
+      3. Sms24MeProvider           (1,116 numbers, mixed real + IoT)
+      4. ReceiveSmsFreeProvider    (36+ numbers, real segments 13x/15x/17x/18x)
+      5. ReceiveSmsIoProvider      (9 numbers, segments 130/132)
+      6. TextVerificationProvider  (44 numbers, IoT segments 196/197/181 — often blocked)
+      7. QuackrProvider            (large source, but China often empty)
+      8. SuperCloudSMSProvider     (fewer numbers, least reliable)
 
     Note: Text-verification.net's IoT segments (196/197/181) are blocked by
-    Trae. Normal segments (13x/15x/17x/18x) from goinsms.xyz, sms24.me,
-    receivesms-free.com and receive-sms.io have a much better chance of
-    receiving Trae OTPs.
+    Trae. Normal segments (13x/15x/17x/18x) from smscodeonline.com, goinsms.xyz,
+    sms24.me, receivesms-free.com and receive-sms.io have a much better chance
+    of receiving Trae OTPs.
     """
     providers: list[tuple[str, SmsProvider]] = [
+        ("SmsCodeOnlineProvider", SmsCodeOnlineProvider()),
         ("GoinSmsProvider", GoinSmsProvider()),
         ("Sms24MeProvider", Sms24MeProvider()),
         ("ReceiveSmsFreeProvider", ReceiveSmsFreeProvider()),
